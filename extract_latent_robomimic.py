@@ -9,7 +9,8 @@ from diffusers.models import AutoencoderKLTemporalDecoder
 from torch.utils.data import Dataset
 from accelerate import Accelerator
 
-NUM_CAMERAS_EXPECTED = 3
+"""Number of cameras is inferred from the dataset metadata."""
+NUM_CAMERAS_EXPECTED = None
 
 class EncodeLatentDataset(Dataset):
     def __init__(self, hdf5_path, new_path, svd_path, device, size=(192, 320), rgb_skip=4):
@@ -38,10 +39,22 @@ class EncodeLatentDataset(Dataset):
                     self.demo_to_split[key] = "val"
 
 
-        env_meta = json.loads(self.f["data"].attrs["env_args"])
-        self.camera_names = env_meta.get("env_kwargs", {}).get(
-            "camera_names", ["agentview", "frontview", "robot0_eye_in_hand"]
-        )
+        # Derive camera ordering from actual obs keys to avoid missing views that were
+        # saved via obs_camera_names during rollout (e.g., frontview even if the policy
+        # didn't consume it). We enforce the desired ordering and require all three.
+        first_ep = self.demos[0]
+        obs_keys = list(self.f[f"data/{first_ep}/obs"].keys())
+        cam_keys = [k for k in obs_keys if k.endswith("_image")]
+        available_cams = [k[:-6] for k in cam_keys]  # strip trailing _image
+
+        desired_order = ["agentview", "frontview", "robot0_eye_in_hand"]
+        missing = [c for c in desired_order if c not in available_cams]
+        if missing:
+            raise ValueError(f"Dataset is missing required camera views: {missing}. Available: {available_cams}")
+
+        ordered = [c for c in desired_order if c in available_cams]
+        extras = [c for c in available_cams if c not in desired_order]
+        self.camera_names = ordered + sorted(extras)
 
         self.instruction = "The robot must fit the square nut onto the square peg"
 
@@ -76,27 +89,18 @@ class EncodeLatentDataset(Dataset):
         dones = ep_grp["dones"][()]
         success = bool(np.any(dones > 0))
 
-        # --- Collect image arrays for each camera (already 192x320x3 uint8) ---
-        # Ctrl-World expects exactly 3 cameras stacked spatially as:
-        #   slot 0 (H 0:24):  exterior view 1  (DROID: exterior_1_left)
-        #   slot 1 (H 24:48): exterior view 2  (DROID: exterior_2_left)
-        #   slot 2 (H 48:72): wrist view       (DROID: wrist_left)
-        #
-        # Robomimic has 2 cameras: agentview (exterior) and robot0_eye_in_hand (wrist).
-        # We fill the two exterior slots with agentview and put wrist last, matching
-        # the DROID spatial convention the pre-trained model was trained on.
-        # Zeros are not used: z=0 in SVD latent space decodes to an artifact image,
-        # which would be out-of-distribution relative to DROID pre-training.
         raw_images = {}
+        image_arrays = []
+        # Preserve ordering from env meta so paths stay deterministic
         for cam_name in self.camera_names:
-            raw_images[cam_name] = ep_grp[f"obs/{cam_name}_image"][()]
+            if f"obs/{cam_name}_image" not in ep_grp:
+                raise KeyError(f"Camera '{cam_name}' not found in dataset obs keys")
+            arr = ep_grp[f"obs/{cam_name}_image"][()]
+            image_arrays.append(arr)
+            raw_images[cam_name] = arr
 
-        agentview = raw_images.get("agentview")
-        frontview = raw_images.get("frontview")
-        wrist = raw_images.get("robot0_eye_in_hand")
-
-        # [exterior_1, exterior_2 (dup), wrist] — matches DROID slot convention
-        image_arrays = [agentview, frontview, wrist]
+        # Some downstream consumers expect three views; if the dataset only has two,
+        # keep the available ordering without inserting None placeholders.
 
         traj_info = {
             "success": success,
@@ -124,7 +128,7 @@ class EncodeLatentDataset(Dataset):
 
     def process_traj(self, image_arrays, traj_info, instruction, save_root,
                      traj_id=0, data_type="val", size=(192, 320), rgb_skip=4, device="cuda"):
-        assert len(image_arrays) == NUM_CAMERAS_EXPECTED
+        num_cameras = len(image_arrays)
 
         for video_id, images in enumerate(image_arrays):
             frames = torch.from_numpy(images).permute(0, 3, 1, 2).float() / 255.0 * 2 - 1
@@ -162,11 +166,11 @@ class EncodeLatentDataset(Dataset):
             "raw_length": len(traj_info["observation.state.cartesian_position"]),
             "videos": [
                 {"video_path": f"videos/{data_type}/{traj_id}/{i}.mp4"}
-                for i in range(NUM_CAMERAS_EXPECTED)
+                for i in range(num_cameras)
             ],
             "latent_videos": [
                 {"latent_video_path": f"latent_videos/{data_type}/{traj_id}/{i}.pt"}
-                for i in range(NUM_CAMERAS_EXPECTED)
+                for i in range(num_cameras)
             ],
             "states": cartesian_states,
             # Full-rate observation states (consumed by Dataset_mix via state_id indexing)
