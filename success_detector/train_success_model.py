@@ -360,7 +360,7 @@ def parse_args():
 
     p.add_argument("--train_frac", type=float, default=0.8)
     p.add_argument("--val_frac", type=float, default=0.1)
-    p.add_argument("--rgb_skip", type=int, default=4)
+    p.add_argument("--rgb_skip", type=int, default=1)
 
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=256)

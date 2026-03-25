@@ -15,7 +15,7 @@ class RobomimicLatentDataset(Dataset):
         latent_root: str,
         hdf5_path: str,
         split: str = "train",
-        rgb_skip: int = 4,
+        rgb_skip: int = 1,
         preload: bool = True,
         temporal_window: int = 1,
     ):
@@ -128,6 +128,9 @@ class RobomimicLatentDataset(Dataset):
             "timestep": frame_idx,
             "traj_id": ep_id,
             "num_frames": anno["video_length"],
+            "distance_to_goal": torch.tensor(
+                float(T - frame_idx - 1), dtype=torch.float32
+            ),
         }
 
         if ep_id in self._per_traj_dones:
@@ -219,7 +222,7 @@ def build_combined_dataset(
     latent_roots: list[str],
     hdf5_paths: list[str],
     split: str = "train",
-    rgb_skip: int = 4,
+    rgb_skip: int = 1,
     preload: bool = True,
 ) -> ConcatDataset:
     """Convenience helper to merge multiple latent datasets (e.g. downloaded

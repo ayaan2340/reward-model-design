@@ -19,15 +19,27 @@ module load pytorch-conda/2.8
 module load ffmpeg
 conda activate ctrl-world
 accelerate launch \
-    --num_processes 4 \
+    --num_processes 2 \
     --num_machines 1 \
     --mixed_precision no \
     /u/asunesara/reward-model-design/extract_latent_robomimic.py \
         --hdf5_path /scratch/bggq/asunesara/square_image_dense_three.hdf5 \
         --output_path /scratch/bggq/asunesara/robomimic_square_latents \
-        --svd_path /projects/bggq/asunesara/.cache/huggingface/hub/models--stabilityai--stable-video-diffusion-img2vid/snapshots/9cf024d5bfa8f56622af86c884f26a52f6676f2e/
+        --svd_path /projects/bggq/asunesara/.cache/huggingface/hub/models--stabilityai--stable-video-diffusion-img2vid/snapshots/9cf024d5bfa8f56622af86c884f26a52f6676f2e/ \
+        --rgb_skip 1
+
+accelerate launch \
+    --num_processes 2 \
+    --num_machines 1 \
+    --mixed_precision no \
+    /u/asunesara/reward-model-design/extract_latent_robomimic.py \
+        --hdf5_path /projects/bggq/asunesara/rollout_dataset/output.hdf5 \
+        --output_path /projects/bggq/asunesara/rollout_dataset/robomimic_policy_square_latents \
+        --svd_path /projects/bggq/asunesara/.cache/huggingface/hub/models--stabilityai--stable-video-diffusion-img2vid/snapshots/9cf024d5bfa8f56622af86c884f26a52f6676f2e/ \
+        --rgb_skip 1
 
 echo "Encoding complete. Copying output to /projects..."
+rm -r /projects/bggq/asunesara/robomimic_square_latents
 cp -r /scratch/bggq/asunesara/robomimic_square_latents \
       /projects/bggq/asunesara/robomimic_square_latents
 echo "Copy complete."
