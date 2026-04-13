@@ -1,0 +1,9 @@
+{
+  "output_max": 1,
+  "output_min": -1,
+  "kp": 0.25,
+  "velocity_limits": [-1, 1],
+  "interpolation": null,
+  "ramp_ratio": 0.2,
+  "use_torque_compensation": true
+}

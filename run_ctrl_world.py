@@ -1,28 +1,3 @@
-"""
-Roll out a Ctrl-World world model using a robomimic BC-Transformer-GMM policy
-trained on 5Hz accumulated delta actions.
-
-The policy predicts 5 delta actions (1 second at 5Hz) per forward pass.  These
-deltas are accumulated from the trajectory's initial absolute EEF pose into
-absolute cartesian poses, then normalized with stat.json bounds and fed as
-action conditioning to the world model.
-
-Starting frames come from a pre-extracted Ctrl-World dataset (produced by
-extract_latent_robomimic.py).  The script saves predicted video rollouts
-to an output folder.
-
-Usage:
-    python run_ctrl_world.py \
-        --robomimic_ckpt /path/to/bc_transformer.pth \
-        --ctrl_world_ckpt /path/to/checkpoint-XXXXX.pt \
-        --dataset_dir /path/to/extracted_dataset \
-        --output_dir /path/to/output \
-        --num_rollouts 5 \
-        --svd_model_path /path/to/stable-video-diffusion-img2vid \
-        --clip_model_path /path/to/clip-vit-base-patch32 \
-        --data_stat_path /path/to/stat.json
-"""
-
 import argparse
 import datetime
 import json
@@ -43,11 +18,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Ctrl-World"))
 from models.pipeline_ctrl_world import CtrlWorldDiffusionPipeline
 from models.ctrl_world import CrtlWorld
 
-# Camera view ordering -- must match Ctrl-World latent stacking and policy training
 CAMERA_ORDER = ["agentview", "frontview", "robot0_eye_in_hand"]
 INSTRUCTION = "The robot must fit the square nut onto the square peg"
 
-# Ctrl-World world model hyperparameters (from config.py defaults)
 NUM_FRAMES = 5
 NUM_HISTORY = 6
 ACTION_DIM = 7
@@ -66,8 +39,6 @@ def denormalize_bound(data, data_min, data_max):
 
 
 def load_ctrl_world(args, device, dtype):
-    """Load and return the Ctrl-World model ready for inference."""
-
     class WMArgs:
         pass
 
@@ -113,7 +84,6 @@ def load_ctrl_world(args, device, dtype):
 
 
 def load_robomimic_policy(ckpt_path, device):
-    """Load BC-Transformer policy and return RolloutPolicy, ckpt_dict, and action norm stats."""
     policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=ckpt_path, device=device, verbose=True)
     policy.start_episode()
 
@@ -126,8 +96,6 @@ def load_robomimic_policy(ckpt_path, device):
 
 
 def get_traj_initial_state(dataset_dir, episode_id, start_idx, state_p01, state_p99, device, dtype, vae):
-    """Load annotation, latent videos, and initial state for one trajectory."""
-    # try val first, then train
     for split in ["val", "train"]:
         ann_path = os.path.join(dataset_dir, "annotation", split, f"{episode_id}.json")
         if os.path.exists(ann_path):
@@ -137,10 +105,8 @@ def get_traj_initial_state(dataset_dir, episode_id, start_idx, state_p01, state_
 
     instruction = anno["texts"][0] if anno.get("texts") else INSTRUCTION
 
-    # load states (5Hz, already cartesian+gripper, 7D)
     states = np.array(anno["states"])  # (T, 7)
 
-    # load latent videos for each camera
     video_latents = []
     for cam_idx in range(len(anno["latent_videos"])):
         lpath = anno["latent_videos"][cam_idx]["latent_video_path"]
@@ -148,7 +114,6 @@ def get_traj_initial_state(dataset_dir, episode_id, start_idx, state_p01, state_
         lat = torch.load(lpath, map_location="cpu")  # (T, 4, H, W)
         video_latents.append(lat.to(device).to(dtype))
 
-    # load pixel videos for initial obs construction
     from decord import VideoReader, cpu as decord_cpu
     pixel_videos = []
     for cam_idx in range(len(anno["videos"])):
@@ -161,10 +126,8 @@ def get_traj_initial_state(dataset_dir, episode_id, start_idx, state_p01, state_
             frames = vr.get_batch(range(len(vr))).numpy()
         pixel_videos.append(frames)
 
-    initial_state = states[start_idx]  # (7,) absolute cartesian pose
-    initial_state_norm = normalize_bound(initial_state[None, :], state_p01, state_p99)  # (1, 7)
-
-    # stack 3-camera latents at start_idx into (4, 72, 40)
+    initial_state = states[start_idx]
+    initial_state_norm = normalize_bound(initial_state[None, :], state_p01, state_p99)
     first_latent = torch.cat([v[start_idx] for v in video_latents], dim=1).unsqueeze(0)  # (1, 4, 72, 40)
 
     initial_pixel_obs = [v[start_idx] for v in pixel_videos]  # list of 3 x (H, W, 3)
@@ -183,7 +146,6 @@ def get_traj_initial_state(dataset_dir, episode_id, start_idx, state_p01, state_
 
 
 def decode_latents_to_pixels(latents, pipeline, decode_chunk_size, dtype):
-    """Decode VAE latents to uint8 pixel arrays. latents: (B, F, C, H, W)"""
     bsz, frame_num = latents.shape[:2]
     x = latents.flatten(0, 1)
     decoded = []
@@ -200,18 +162,6 @@ def decode_latents_to_pixels(latents, pipeline, decode_chunk_size, dtype):
 
 
 def build_obs_dict_from_pixels(pixel_frames, eef_state_raw):
-    """
-    Build a robomimic-compatible observation dict from decoded pixel frames
-    and raw (denormalized) EEF state.
-
-    Images are passed at their native resolution (192x320 from the WM decoder)
-    so that the policy's CropRandomizer (trained on 192x320) works correctly.
-
-    Args:
-        pixel_frames: list of 3 np arrays, each (H, W, 3) uint8 for
-                      [agentview, frontview, robot0_eye_in_hand]
-        eef_state_raw: (7,) array [x,y,z,roll,pitch,yaw,gripper_scalar]
-    """
     obs = {}
     cam_keys = ["agentview_image", "frontview_image", "robot0_eye_in_hand_image"]
     for cam_key, frame in zip(cam_keys, pixel_frames):
@@ -224,21 +174,6 @@ def build_obs_dict_from_pixels(pixel_frames, eef_state_raw):
 
 
 def get_delta_chunk(policy, obs_buffer, action_norm_stats):
-    """
-    Run the BC-Transformer-GMM policy on an observation buffer to get the
-    full 5-delta action chunk, bypassing get_action's single-step reduction.
-
-    The network output is in min_max-normalized space; this function
-    unnormalizes it back to raw delta actions.
-
-    Args:
-        policy: RolloutPolicy wrapper
-        obs_buffer: list of 5 obs dicts (one per context frame)
-        action_norm_stats: dict with "actions" -> {"scale": ..., "offset": ...}
-
-    Returns:
-        deltas: (5, 7) numpy array of raw (unnormalized) delta actions
-    """
     stacked_obs = {}
     for k in obs_buffer[0]:
         stacked_obs[k] = np.stack([ob[k] for ob in obs_buffer], axis=0)
@@ -254,17 +189,6 @@ def get_delta_chunk(policy, obs_buffer, action_norm_stats):
 
 
 def deltas_to_absolute_poses_norm(deltas_5hz, initial_state, state_p01, state_p99):
-    """Convert 5 raw delta actions into 5 normalized absolute poses for the WM.
-
-    Args:
-        deltas_5hz: (5, 7) unnormalized delta actions [dx,dy,dz,dax,day,daz,gripper]
-        initial_state: (7,) [x,y,z,roll,pitch,yaw,gripper] starting absolute pose
-        state_p01: (1, 7) normalization lower bound from stat.json
-        state_p99: (1, 7) normalization upper bound from stat.json
-
-    Returns:
-        poses_norm: (5, 7) normalized absolute poses in [-1, 1]
-    """
     current_pos = initial_state[:3].copy()
     current_rot = Rotation.from_euler("xyz", initial_state[3:6])
     poses = []
@@ -280,18 +204,6 @@ def deltas_to_absolute_poses_norm(deltas_5hz, initial_state, state_p01, state_p9
 
 
 def forward_world_model(model, wm_args, action_cond, current_latent, his_latent, text, device, dtype):
-    """
-    Run the Ctrl-World world model forward.
-
-    Args:
-        action_cond: (num_history+num_frames, 7) numpy, already normalized to [-1, 1]
-        current_latent: (1, 4, 72, 40) tensor, current frame latent
-        his_latent: (1, num_history, 4, 72, 40) tensor, history latents
-        text: instruction string or None
-    Returns:
-        predict_latents: raw latents from the pipeline, rearranged per-view
-        decoded_videos: (3, num_frames, H, W, 3) uint8 numpy, per-view decoded frames
-    """
     action_tensor = torch.tensor(action_cond, dtype=dtype).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -320,7 +232,6 @@ def forward_world_model(model, wm_args, action_cond, current_latent, his_latent,
             frame_level_cond=True,
         )
 
-    # split stacked 3-camera latents into per-view: (3, F, C, H, W)
     predict_latents = einops.rearrange(latents, "b f c (m h) (n w) -> (b m n) f c h w", m=3, n=1)
 
     decoded_videos = decode_latents_to_pixels(
@@ -347,17 +258,14 @@ def main():
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
     dtype = torch.bfloat16
 
-    # load normalization stats
     with open(args.data_stat_path, "r") as f:
         data_stat = json.load(f)
     state_p01 = np.array(data_stat["state_01"])[None, :]
     state_p99 = np.array(data_stat["state_99"])[None, :]
 
-    # load models
     policy, ckpt_dict, action_norm_stats = load_robomimic_policy(args.robomimic_ckpt, device)
     model, wm_args = load_ctrl_world(args, device, dtype)
 
-    # discover available trajectories from dataset annotation
     traj_ids = []
     for split in ["val", "train"]:
         ann_dir = os.path.join(args.dataset_dir, "annotation", split)
@@ -382,14 +290,12 @@ def main():
             device, dtype, model.pipeline.vae,
         )
 
-        # initialize history buffers
         his_cond = []
         his_eef = []
         for _ in range(NUM_HISTORY * 4):
             his_cond.append(traj["first_latent"])
             his_eef.append(traj["initial_state_norm"].copy())
 
-        # initialize observation frame buffer (5 frames for context_length=5)
         current_raw_state = traj["initial_state"].copy()
         obs_buffer = []
         init_obs = build_obs_dict_from_pixels(traj["initial_pixel_obs"], current_raw_state)
@@ -402,15 +308,12 @@ def main():
         for step_i in range(args.interact_num):
             print(f"  Step {step_i+1}/{args.interact_num}")
 
-            # -- Policy forward: get 5 raw delta actions --
             deltas = get_delta_chunk(policy, obs_buffer, action_norm_stats)  # (5, 7)
 
-            # -- Convert deltas to normalized absolute poses for WM --
             abs_poses_norm = deltas_to_absolute_poses_norm(
                 deltas, current_raw_state, state_p01, state_p99
             )  # (5, 7) normalized
 
-            # -- Build action conditioning for world model --
             action_cond = np.concatenate(
                 [his_eef[idx] for idx in HISTORY_IDX], axis=0
             )  # (6, 7)
@@ -421,28 +324,22 @@ def main():
             ).unsqueeze(0)  # (1, 6, 4, 72, 40)
             current_latent = his_cond[-1]  # (1, 4, 72, 40)
 
-            # -- World model forward --
             predict_latents, decoded_videos = forward_world_model(
                 model, wm_args, action_cond, current_latent, his_latent,
                 traj["instruction"], device, dtype,
             )
-            # decoded_videos: (3, 5, H, W, 3) -- 3 cameras, 5 frames each
 
-            # -- Update history buffers --
             last_pose_norm = abs_poses_norm[PRED_STEP - 1:PRED_STEP]  # (1, 7)
             his_eef.append(last_pose_norm)
-            # Stack 3 camera latents along H (dim=1), same as get_traj_initial_state / first_latent.
             last_latent = torch.cat(
                 [predict_latents[cam_i, PRED_STEP - 1] for cam_i in range(3)], dim=1
-            ).unsqueeze(0)  # each cam (4,24,40) -> (4,72,40) -> (1,4,72,40)
+            ).unsqueeze(0)
             his_cond.append(last_latent)
 
-            # -- Update current_raw_state for next step's delta accumulation --
             current_raw_state = denormalize_bound(
                 abs_poses_norm[PRED_STEP - 1], state_p01[0], state_p99[0]
             )
 
-            # -- Update observation buffer for next policy call --
             obs_buffer = []
             for frame_i in range(PRED_STEP):
                 frame_pixels = [decoded_videos[cam_i, frame_i] for cam_i in range(3)]
@@ -451,14 +348,12 @@ def main():
                 )
                 obs_buffer.append(build_obs_dict_from_pixels(frame_pixels, raw_state_at_frame))
 
-            # -- Collect frames for video (concatenate 3 camera views horizontally) --
             for frame_i in range(PRED_STEP - 1):
                 concat_frame = np.concatenate(
                     [decoded_videos[cam_i, frame_i] for cam_i in range(3)], axis=1
                 )  # (H, W*3, 3)
                 video_frames_to_save.append(concat_frame)
 
-        # -- Save rollout video --
         if video_frames_to_save:
             video = np.stack(video_frames_to_save, axis=0)
             uuid = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

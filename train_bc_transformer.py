@@ -1,24 +1,3 @@
-"""
-Train a BC-Transformer-GMM policy on a 5Hz-subsampled robosuite dataset
-whose actions are accumulated delta actions (position summed, rotation composed).
-
-The policy predicts a chunk of 5 delta actions in a single forward pass
-(pred_future_acs=True, seq_length=5), covering 1 second at 5Hz.  For Ctrl-World
-rollout the deltas are accumulated into absolute poses at inference time; for
-robosuite evaluation the checkpoint stores control_freq=5 so the env runs natively
-at 5Hz.
-
-Robomimic requires HDF5 `mask/train` and `mask/valid` when validation is enabled.
-This script sets `hdf5_filter_key` / `hdf5_validation_filter_key` accordingly and, if
-those masks are missing, creates a random train/valid split (see `--val_ratio`).
-
-Usage:
-    python train_bc_transformer.py \
-        --dataset /path/to/subsampled_5hz_deltas.hdf5 \
-        --output_dir /path/to/output \
-        --name square_bc_transformer
-"""
-
 import argparse
 import logging
 import os
@@ -39,13 +18,6 @@ from robomimic.utils.file_utils import create_hdf5_filter_key, load_dict_from_ch
 log = logging.getLogger(__name__)
 
 def ensure_hdf5_train_val_masks(dataset_path, val_ratio=0.1, seed=1):
-    """
-    Ensure the HDF5 has non-overlapping mask/train and mask/valid.
-    If missing or invalid, writes a new split (modifies the file in place).
-
-    Returns:
-        use_validation (bool): False if fewer than 2 demos (train on all data, no val).
-    """
     path = os.path.expanduser(dataset_path)
 
     def read_masks():
@@ -91,7 +63,6 @@ def ensure_hdf5_train_val_masks(dataset_path, val_ratio=0.1, seed=1):
 
 
 def install_epoch_logging():
-    """Wrap TrainUtils.run_epoch to emit concise one-line per-epoch logs to stderr."""
     _orig = TrainUtils.run_epoch
 
     def _wrapped(*args, **kwargs):
@@ -125,7 +96,6 @@ def install_epoch_logging():
 
 
 def print_training_summary(output_dir, experiment_name):
-    """Print best validation loss and rollout success rate from last.pth if present."""
     base = os.path.join(os.path.expanduser(output_dir), experiment_name)
     if not os.path.isdir(base):
         return
@@ -160,14 +130,9 @@ def print_training_summary(output_dir, experiment_name):
 
 
 def build_config(dataset_path, output_dir, experiment_name, use_validation=True, seed=1):
-    """
-    Build BC-Transformer-GMM config.  Only overrides that differ from
-    config_factory("bc") programmatic defaults are listed here.
-    """
     config = config_factory("bc")
 
     with config.values_unlocked():
-        # -- experiment (defaults: validate=False, rollout.enabled=True, log_wandb=False) --
         config.experiment.name = experiment_name
         config.experiment.validate = use_validation
         config.experiment.save.on_best_validation = True
@@ -176,10 +141,8 @@ def build_config(dataset_path, output_dir, experiment_name, use_validation=True,
         config.experiment.logging.log_wandb = True
         config.experiment.logging.wandb_proj_name = "ctrl-world-bc-5"
 
-        # -- env override: bake control_freq=5 into checkpoint for robosuite eval --
         config.experiment.env_meta_update_dict = {"env_kwargs": {"control_freq": 5}}
 
-        # -- training (defaults: num_epochs=2000, max_grad_norm=None, frame/seq=1) --
         config.train.data = [{"path": dataset_path}]
         config.train.output_dir = output_dir
         config.train.seed = seed
@@ -194,23 +157,19 @@ def build_config(dataset_path, output_dir, experiment_name, use_validation=True,
             config.train.hdf5_filter_key = "train"
             config.train.hdf5_validation_filter_key = "valid"
 
-        # -- algo: optimizer (defaults: adam, L2=0, epoch_schedule=[], multistep) --
         config.algo.optim_params.policy.optimizer_type = "adamw"
         config.algo.optim_params.policy.learning_rate.epoch_schedule = [200]
         config.algo.optim_params.policy.learning_rate.scheduler_type = "linear"
         config.algo.optim_params.policy.regularization.L2 = 0.01
 
-        # -- algo: architecture (defaults: actor_layer_dims=(1024,1024), gmm=off, transformer=off) --
         config.algo.actor_layer_dims = []
         config.algo.gmm.enabled = True
         config.algo.transformer.enabled = True
         config.algo.transformer.context_length = 5
         config.algo.transformer.supervise_all_steps = True
         config.algo.transformer.pred_future_acs = True
-        # Eval: dequeue predicted action chunk like diffusion (serialized in checkpoint).
         config.algo.transformer.use_action_queue = True
 
-        # -- observations (defaults: include "object", no rgb, no CropRandomizer) --
         config.observation.modalities.obs.low_dim = [
             "robot0_eef_pos",
             "robot0_eef_quat",

@@ -1,17 +1,3 @@
-"""
-Subsample a 20Hz robosuite HDF5 dataset to 5Hz with accumulated delta actions.
-
-Every 4 consecutive 20Hz delta actions are combined into a single 5Hz delta:
-  - Position deltas: summed (world-frame OSC_POSE deltas are additive)
-  - Rotation deltas: composed via scipy Rotation (axis-angle)
-  - Gripper: last value in the window
-
-The output HDF5 also updates env_args to set control_freq=5 so that robomimic
-rollout scripts create a 5Hz robosuite environment automatically.
-
-Camera ordering: agentview, frontview, robot0_eye_in_hand (must match Ctrl-World).
-"""
-
 import argparse
 import json
 import os
@@ -26,16 +12,6 @@ CAMERA_ORDER = ["agentview", "frontview", "robot0_eye_in_hand"]
 
 
 def accumulate_deltas(actions_20hz, start, skip):
-    """Accumulate `skip` consecutive 20Hz delta actions into one 5Hz delta.
-
-    Args:
-        actions_20hz: (N, 7) full 20Hz action array
-        start: index of first action in the window
-        skip: number of actions to accumulate (typically 4)
-
-    Returns:
-        (7,) accumulated delta action
-    """
     window = actions_20hz[start:start + skip]  # (skip, 7)
     pos_delta = window[:, :3].sum(axis=0)
 
@@ -49,7 +25,6 @@ def accumulate_deltas(actions_20hz, start, skip):
 
 
 def subsample_demo(src_grp, dst_grp, skip):
-    """Subsample one demo group and write to dst_grp."""
     orig_actions = src_grp["actions"][()]  # (orig_len, 7) -- 20Hz deltas
     orig_len = orig_actions.shape[0]
 
@@ -61,7 +36,6 @@ def subsample_demo(src_grp, dst_grp, skip):
     if n_sub < 1:
         return 0
 
-    # -- accumulate 4 consecutive 20Hz deltas into each 5Hz delta --
     accumulated = []
     for i in range(n_sub):
         act_start = i * skip
@@ -72,7 +46,6 @@ def subsample_demo(src_grp, dst_grp, skip):
 
     dst_grp.create_dataset("actions", data=actions_5hz)
 
-    # -- subsample observations (at obs_indices[:n_sub], i.e. the "current" obs) --
     src_obs_indices = obs_indices[:n_sub]
 
     obs_grp = dst_grp.create_group("obs")
@@ -84,7 +57,6 @@ def subsample_demo(src_grp, dst_grp, skip):
     for low_dim_key in ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]:
         obs_grp.create_dataset(low_dim_key, data=src_grp[f"obs/{low_dim_key}"][()][src_obs_indices])
 
-    # -- dones --
     orig_dones = src_grp["dones"][()]
     sub_dones = orig_dones[skip - 1::skip][:n_sub]
     if len(sub_dones) < n_sub:
@@ -119,14 +91,12 @@ def main():
 
     dst_data.attrs["total"] = total_samples
 
-    # copy env_args and update control_freq to match the subsampled rate
     if "env_args" in src["data"].attrs:
         env_args = json.loads(src["data"].attrs["env_args"])
         if "env_kwargs" in env_args:
             env_args["env_kwargs"]["control_freq"] = 20 // args.skip
         dst_data.attrs["env_args"] = json.dumps(env_args, indent=4)
 
-    # preserve train/valid masks
     if "mask" in src:
         mask_grp = dst.create_group("mask")
         for split in src["mask"]:
