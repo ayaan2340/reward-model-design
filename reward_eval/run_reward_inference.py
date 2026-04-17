@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Run a single reward backend over manifest trajectories; write per-demo npz predictions."""
+"""Run a single reward backend over manifest trajectories; write per-demo npz predictions.
+
+RBM/ReWiND: progress head uses Sigmoid (continuous) or bin softmax expectation (discrete); saved ``pred``
+is clipped to ``[0, 1]`` after length alignment.
+
+Optional success outputs (when the backend defines them): ``traj_success_pred`` (0/1 scalar),
+``success_pred_first_frame`` / ``success_pred_timing_frame`` (aligned to manifest length; TOPReward uses the
+last frame for timing when successful), ``pred_success_dense``, and for the latent success detector
+``pred_success_logit``. RoboDopamine omits meaningful success (NaN trajectory label).
+"""
 
 from __future__ import annotations
 
@@ -30,6 +39,19 @@ def align_pred_length(pred: np.ndarray, target_len: int) -> tuple[np.ndarray, bo
     x_old = np.linspace(0.0, 1.0, num=pred.size)
     x_new = np.linspace(0.0, 1.0, num=target_len)
     return np.interp(x_new, x_old, pred).astype(np.float64), True
+
+
+def align_time_index(native_idx: float, native_len: int, t_full: int) -> float:
+    """Map a frame index on the native ``pred`` timeline (0 … native_len-1) to manifest length ``t_full``."""
+    if native_idx != native_idx:
+        return float("nan")
+    nl = int(native_len)
+    tf = int(t_full)
+    if tf <= 0:
+        return float("nan")
+    if nl <= 1:
+        return 0.0
+    return float(np.clip(native_idx * (tf - 1) / (nl - 1), 0.0, tf - 1))
 
 
 def load_manifest(path: Path) -> list[dict[str, str]]:
@@ -106,11 +128,62 @@ def main() -> None:
         help="Skip demos that already have a valid pred/gt npz (same length). Corrupt/incomplete files are recomputed.",
     )
     p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Recompute every demo even if a valid-looking npz exists (e.g. fix all-zero preds left by an old run). Overrides --resume.",
+    )
+    p.add_argument(
         "--rbm-max-frames",
         type=int,
         default=48,
         help="rbm only: max frames per model forward (uniform subsample, then interpolate to full T). "
         "Qwen3-VL uses huge memory for long videos; lower if OOM. Use 0 for no subsampling (may OOM).",
+    )
+    p.add_argument(
+        "--robodopamine-frame-interval",
+        type=int,
+        default=30,
+        help="robodopamine: GRM compares frame[i]→frame[i+interval]; 1 often yields 0%% hops (tiny visual delta). "
+        "Default 30 matches slurm; use 15 only if you need dense steps (slower, may stay flat).",
+    )
+    p.add_argument(
+        "--robodopamine-eval-mode",
+        type=str,
+        default="incremental",
+        choices=("incremental", "forward", "backward"),
+        help="robodopamine: incremental=hops per step (matches SYSTEM_PROMPT); forward/backward see rbd_inference.",
+    )
+    p.add_argument(
+        "--topreward-success-threshold",
+        type=float,
+        default=0.95,
+        help="topreward_qwen: trajectory success if any length-3 mean of normalized prefix scores exceeds this (default 0.95).",
+    )
+    p.add_argument(
+        "--topreward-max-frames",
+        type=int,
+        default=48,
+        help="topreward_qwen: subsample trajectories longer than this before prefix scoring (default 48, same as "
+        "--rbm-max-frames).",
+    )
+    p.add_argument(
+        "--topreward-num-prefix-samples",
+        type=int,
+        default=0,
+        help="topreward_qwen: number of equally spaced prefix lengths to score. Default 0 = dense: one VLM forward "
+        "per frame after --topreward-max-frames trim (matches robometer RBM per-frame prediction count). "
+        "Set to e.g. 15 for faster runs with interpolation between anchors.",
+    )
+    p.add_argument(
+        "--robodopamine-expert-goal-frames-npz",
+        type=str,
+        default="",
+        help="robodopamine: path to a preprocess frames.npz (e.g. expert demo); last RGB frame = REFERENCE END for every trajectory.",
+    )
+    p.add_argument(
+        "--robodopamine-auto-expert-goal",
+        action="store_true",
+        help="robodopamine: use first manifest row with dataset_name=expert_ph and existing frames_npz as goal (ignored if --robodopamine-expert-goal-frames-npz is set).",
     )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
@@ -124,14 +197,50 @@ def main() -> None:
     rows = load_manifest(manifest_path)
     backend_name = args.backend.lower().strip()
 
+    expert_goal_npz = ""
+    if backend_name == "robodopamine":
+        expert_goal_npz = (args.robodopamine_expert_goal_frames_npz or "").strip()
+        if expert_goal_npz:
+            expert_goal_npz = str(Path(expert_goal_npz).expanduser())
+            if not Path(expert_goal_npz).is_file():
+                raise SystemExit(f"--robodopamine-expert-goal-frames-npz not found: {expert_goal_npz}")
+        elif args.robodopamine_auto_expert_goal:
+            for r in rows:
+                if r.get("dataset_name") != "expert_ph":
+                    continue
+                cand = (r.get("frames_npz") or "").strip()
+                if not cand:
+                    continue
+                cp = Path(cand).expanduser()
+                if cp.is_file():
+                    expert_goal_npz = str(cp)
+                    logger.info(
+                        "robodopamine auto expert goal: %s (%s %s)",
+                        expert_goal_npz,
+                        r.get("dataset_name"),
+                        r.get("demo_key"),
+                    )
+                    break
+            else:
+                logger.warning(
+                    "robodopamine: --robodopamine-auto-expert-goal set but no expert_ph row with a valid "
+                    "frames_npz — using each episode's last frame as REFERENCE END"
+                )
+
     kwargs: dict[str, Any] = {}
     if backend_name in ("topreward", "topreward_qwen"):
         if not args.model_path:
             raise SystemExit("--model-path required for TopReward (e.g. Qwen/Qwen3-VL-8B-Instruct)")
         kwargs["model_path"] = args.model_path
+        kwargs["success_threshold"] = float(args.topreward_success_threshold)
+        kwargs["max_frames"] = int(args.topreward_max_frames)
+        kwargs["num_prefix_samples"] = int(args.topreward_num_prefix_samples)
     elif backend_name == "robodopamine":
         mp = args.model_path or "tanhuajie2001/Robo-Dopamine-GRM-3B"
         kwargs["model_path"] = mp
+        kwargs["frame_interval"] = int(args.robodopamine_frame_interval)
+        kwargs["eval_mode"] = str(args.robodopamine_eval_mode)
+        kwargs["expert_goal_frames_npz"] = expert_goal_npz or None
     elif backend_name == "roboreward":
         kwargs["model_path"] = args.model_path or "teetone/RoboReward-8B"
     elif backend_name == "rbm":
@@ -179,7 +288,7 @@ def main() -> None:
         demo_key = row["demo_key"]
         out_path = pred_root / ds / f"{demo_key}.npz"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        if args.resume and out_path.is_file():
+        if args.resume and not args.no_resume and out_path.is_file():
             if _prediction_npz_valid(out_path):
                 logger.info("Resume skip %s", out_path)
                 continue
@@ -217,24 +326,75 @@ def main() -> None:
             continue
 
         pred, resized = align_pred_length(pred_raw, t)
+        pred = np.clip(np.asarray(pred, dtype=np.float64), 0.0, 1.0)
         elapsed = time.time() - t0
+        extra_meta = dict(extra)
+        for _k in ("pred_success_dense", "pred_success_logit"):
+            if _k in extra_meta and isinstance(extra_meta.get(_k), np.ndarray):
+                extra_meta[_k] = f"<saved in npz, shape={extra_meta[_k].shape!s}>"
+        if (
+            "success_pred_first_idx_native" in extra
+            and "success_pred_timing_idx_native" in extra
+            and "success_pred_native_len" in extra
+        ):
+            nl = int(extra["success_pred_native_len"])
+            extra_meta["success_pred_frames_aligned_to_manifest_T"] = int(t)
+            first_al = align_time_index(float(extra["success_pred_first_idx_native"]), nl, t)
+            timing_al = align_time_index(float(extra["success_pred_timing_idx_native"]), nl, t)
+            extra_meta["success_pred_first_frame"] = first_al
+            extra_meta["success_pred_timing_frame"] = timing_al
         sidecar = {
             "backend": out_name,
             "demo_key": demo_key,
             "dataset_name": ds,
             "elapsed_sec": elapsed,
             "aligned_interpolation": resized,
-            "extra": extra,
+            "extra": extra_meta,
             "success_label": meta.get("success_label"),
             "hdf5_done_mode": meta.get("hdf5_done_mode"),
             "hdf5_task_success_attr": meta.get("hdf5_task_success_attr"),
         }
-        np.savez_compressed(
-            out_path,
-            pred=pred.astype(np.float32),
-            gt=gt.astype(np.float32),
-            gt_definition=np.array(row.get("gt_definition", "")),
-        )
+        save_kw: dict[str, Any] = {
+            "pred": pred.astype(np.float32),
+            "gt": gt.astype(np.float32),
+            "gt_definition": np.array(row.get("gt_definition", "")),
+        }
+        if "traj_success_pred" in extra:
+            save_kw["traj_success_pred"] = np.array(float(extra["traj_success_pred"]), dtype=np.float32)
+        if (
+            "success_pred_first_idx_native" in extra
+            and "success_pred_timing_idx_native" in extra
+            and "success_pred_native_len" in extra
+        ):
+            nl = int(extra["success_pred_native_len"])
+            save_kw["success_pred_first_frame"] = np.array(
+                align_time_index(float(extra["success_pred_first_idx_native"]), nl, t), dtype=np.float32
+            )
+            save_kw["success_pred_timing_frame"] = np.array(
+                align_time_index(float(extra["success_pred_timing_idx_native"]), nl, t), dtype=np.float32
+            )
+        for aux_key in ("pred_success_dense", "pred_success_logit"):
+            if aux_key not in extra or extra[aux_key] is None:
+                continue
+            aux = np.asarray(extra[aux_key], dtype=np.float64).ravel()
+            aux_aligned, _ = align_pred_length(aux, t)
+            save_kw[aux_key] = aux_aligned.astype(np.float32)
+        for arr_name, col in (
+            ("gt_linear_time", "gt_linear_time_npy"),
+            ("gt_cumulative_normalized", "gt_cumulative_normalized_npy"),
+        ):
+            pth = (row.get(col) or "").strip()
+            if not pth:
+                continue
+            alt = Path(pth).expanduser()
+            if not alt.is_file():
+                logger.warning("Missing optional %s at %s — skip in npz", arr_name, alt)
+                continue
+            g2 = np.load(alt).astype(np.float64)
+            g2, _ = align_pred_length(g2, t)
+            save_kw[arr_name] = g2.astype(np.float32)
+
+        np.savez_compressed(out_path, **save_kw)
         with open(out_path.with_suffix(".meta.json"), "w", encoding="utf-8") as fh:
             json.dump(sidecar, fh, indent=2)
         logger.info("OK %s/%s pred_len=%d gt_len=%d (%.1fs)", ds, demo_key, pred.shape[0], t, elapsed)

@@ -9,8 +9,8 @@
 #SBATCH --time=04:00:00
 #SBATCH --gpus-per-node=1
 #SBATCH --constraint=projects
-#SBATCH -e slurm-%j.err
-#SBATCH -o slurm-%j.out
+#SBATCH -e slurm-success-detector-%j.err
+#SBATCH -o slurm-success-detector-%j.out
 #SBATCH --mail-user=ayaans@utexas.edu
 #SBATCH --mail-type="BEGIN,END"
 

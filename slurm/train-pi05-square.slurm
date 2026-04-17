@@ -8,9 +8,9 @@
 #SBATCH --job-name=train-pi05-square
 #SBATCH --time=12:00:00
 #SBATCH --constraint="projects"
-#SBATCH -e slurm-%j.err
-#SBATCH -o slurm-%j.out
-#SBATCH --gpus-per-node=1
+#SBATCH -e slurm-train-pi05-square-%j.err
+#SBATCH -o slurm-train-pi05-square-%j.out
+#SBATCH --gpus-per-node=1 
 #SBATCH --mail-user=ayaans@utexas.edu
 #SBATCH --mail-type="BEGIN,END"
 

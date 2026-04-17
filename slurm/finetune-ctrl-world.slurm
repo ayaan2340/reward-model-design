@@ -8,8 +8,8 @@
 #SBATCH --job-name=finetune-ctrl-world
 #SBATCH --time=14:00:00
 #SBATCH --constraint="scratch&projects"
-#SBATCH -e slurm-%j.err
-#SBATCH -o slurm-%j.out
+#SBATCH -e slurm-finetune-ctrl-world-%j.err
+#SBATCH -o slurm-finetune-ctrl-world-%j.out
 #SBATCH --gpus-per-node=8
 #SBATCH --mail-user=ayaans@utexas.edu
 #SBATCH --mail-type="BEGIN,END"

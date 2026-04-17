@@ -8,8 +8,8 @@
 #SBATCH --job-name=train-dtg
 #SBATCH --time=00:30:00
 #SBATCH --constraint="projects"
-#SBATCH -e slurm-%j.err
-#SBATCH -o slurm-%j.out
+#SBATCH -e slurm-train-distance-to-goal-%j.err
+#SBATCH -o slurm-train-distance-to-goal-%j.out
 #SBATCH --gpus-per-node=1
 #SBATCH --mail-user=ayaans@utexas.edu
 #SBATCH --mail-type="BEGIN,END"

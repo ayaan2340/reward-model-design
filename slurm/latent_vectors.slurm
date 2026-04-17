@@ -8,8 +8,8 @@
 #SBATCH --job-name=latent_vectors
 #SBATCH --time=01:00:00
 #SBATCH --constraint="scratch&projects"
-#SBATCH -e slurm-%j.err
-#SBATCH -o slurm-%j.out
+#SBATCH -e slurm-latent-vectors-%j.err
+#SBATCH -o slurm-latent-vectors-%j.out
 #SBATCH --gpus-per-node=2
 #SBATCH --mail-user=ayaans@utexas.edu
 #SBATCH --mail-type="BEGIN,END"

@@ -15,6 +15,65 @@ import torch
 logger = logging.getLogger("reward_eval.backends")
 
 
+def _roboreward_discrete_score_from_normalized(pred_broadcast: np.ndarray) -> int:
+    """Invert RoboReward normalization ``pred = score/4 - 0.25`` to integer 1..5."""
+    pv = float(np.asarray(pred_broadcast, dtype=np.float64).ravel()[0])
+    disc = int(np.clip(np.round((pv + 0.25) * 4.0), 1, 5))
+    return disc
+
+
+def _first_positive_frame_1d(
+    mask: np.ndarray,
+) -> float:
+    """First index where boolean mask is True; NaN if none."""
+    m = np.asarray(mask, dtype=bool).ravel()
+    hit = np.flatnonzero(m)
+    return float(hit[0]) if hit.size else float("nan")
+
+
+def _topreward_sliding_window_success(
+    progress_dense: np.ndarray, *, threshold: float, window: int = 3
+) -> tuple[float, np.ndarray, float]:
+    """TOPReward: success if any length-``window`` mean of min–max normalized prefix scores exceeds ``threshold``.
+
+    Returns:
+        traj_success, rolling-start window means (NaN padded), first window **start** index (pred timeline)
+        where the mean crosses ``threshold``, else NaN.
+    """
+    p = np.asarray(progress_dense, dtype=np.float64).ravel()
+    t = int(p.size)
+    if t == 0:
+        return 0.0, p, float("nan")
+    if t < window:
+        m = float(np.mean(p))
+        dense = np.full(t, m, dtype=np.float64)
+        ok = m > threshold
+        first_start = 0.0 if ok else float("nan")
+        return ((1.0 if ok else 0.0), dense, first_start)
+    dense = np.full(t, np.nan, dtype=np.float64)
+    best = 0.0
+    first_start: float | None = None
+    for i in range(t - window + 1):
+        wmean = float(p[i : i + window].mean())
+        dense[i] = wmean
+        best = max(best, wmean)
+        if first_start is None and wmean > threshold:
+            first_start = float(i)
+    fs = float(first_start) if first_start is not None else float("nan")
+    return (1.0 if best > threshold else 0.0), dense, fs
+
+
+def _interp_01(y: np.ndarray, n_from: int, n_to: int) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float64).ravel()
+    if n_from == n_to:
+        return y.copy()
+    if n_from == 0:
+        return np.zeros(n_to, dtype=np.float64)
+    x_old = np.linspace(0.0, 1.0, num=n_from)
+    x_new = np.linspace(0.0, 1.0, num=n_to)
+    return np.interp(x_new, x_old, y).astype(np.float64)
+
+
 def _ensure_robometer() -> None:
     root = os.environ.get("ROBOMETER_ROOT", "/u/asunesara/robometer")
     if root not in sys.path:
@@ -41,8 +100,18 @@ class TopRewardBackend(RewardBackend):
         from robometer.evals.baselines.topreward import TopReward
 
         self.name = "topreward_qwen"
+        self._success_threshold = float(kwargs.pop("success_threshold", 0.95))
+        # Defaults match ``--rbm-max-frames`` / dense per-frame scoring (see run_reward_inference).
+        self._num_prefix_samples = int(kwargs.get("num_prefix_samples", 0))
+        self._max_frames = int(kwargs.get("max_frames", 48))
         self._m = TopReward(model_path=model_path, **kwargs)
-        logger.info("TopReward loaded: %s", model_path)
+        logger.info(
+            "TopReward loaded: %s (success_threshold=%s max_frames=%s num_prefix_samples=%s)",
+            model_path,
+            self._success_threshold,
+            self._max_frames,
+            self._num_prefix_samples,
+        )
 
     def predict_dense(
         self,
@@ -53,7 +122,25 @@ class TopRewardBackend(RewardBackend):
     ) -> tuple[np.ndarray, dict[str, Any]]:
         out = self._m.compute_progress(frames_hwc, task_description=task_text)
         pred = np.asarray(out, dtype=np.float64).ravel()
-        return pred, {"backend": self.name}
+        traj_s, succ_dense, first_win_start = _topreward_sliding_window_success(
+            pred, threshold=self._success_threshold, window=3
+        )
+        t_native = int(pred.size)
+        timing_native = float(t_native - 1) if traj_s >= 0.5 and t_native > 0 else float("nan")
+        return pred, {
+            "backend": self.name,
+            "topreward_max_frames": self._max_frames,
+            "topreward_num_prefix_samples": self._num_prefix_samples,
+            "topreward_dense_prefixes": self._num_prefix_samples <= 0,
+            "success_metric": "topreward_sliding_mean3",
+            "topreward_success_threshold": self._success_threshold,
+            "traj_success_pred": float(traj_s),
+            "pred_success_dense": succ_dense,
+            # Frame indices on the same timeline as ``pred`` (before manifest alignment); map in run_reward_inference.
+            "success_pred_first_idx_native": float(first_win_start),
+            "success_pred_timing_idx_native": timing_native,
+            "success_pred_native_len": int(t_native),
+        }
 
 
 class RoboDopamineBackend(RewardBackend):
@@ -62,6 +149,20 @@ class RoboDopamineBackend(RewardBackend):
         from robometer.evals.baselines.robodopamine import RoboDopamine
 
         self.name = "robodopamine"
+        eg = kwargs.pop("expert_goal_frames_npz", None) or ""
+        self._expert_goal_rgb: np.ndarray | None = None
+        self._expert_goal_source: str = ""
+        if eg:
+            p = Path(str(eg)).expanduser()
+            if not p.is_file():
+                raise FileNotFoundError(f"RoboDopamine expert goal frames_npz not found: {p}")
+            z = np.load(p)
+            rgb = z["rgb"]
+            if rgb.ndim != 4 or int(rgb.shape[-1]) < 3:
+                raise ValueError(f"Bad rgb in expert goal npz {p}: shape={getattr(rgb, 'shape', None)}")
+            self._expert_goal_rgb = np.asarray(rgb[-1, ..., :3], dtype=np.uint8)
+            self._expert_goal_source = str(p)
+            logger.info("RoboDopamine REFERENCE END = last frame of %s", p)
         self._m = RoboDopamine(model_path=model_path, **kwargs)
         logger.info("RoboDopamine loaded: %s", model_path)
 
@@ -72,9 +173,20 @@ class RoboDopamineBackend(RewardBackend):
         *,
         meta: dict[str, Any],
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        out = self._m.compute_progress(frames_hwc, task_description=task_text)
+        out = self._m.compute_progress(
+            frames_hwc,
+            task_description=task_text,
+            reference_goal_rgb=self._expert_goal_rgb,
+        )
         pred = np.asarray(out, dtype=np.float64).ravel()
-        return pred, {"backend": self.name}
+        extra: dict[str, Any] = {
+            "backend": self.name,
+            "success_metric": "skipped",
+            "traj_success_pred": float("nan"),
+        }
+        if self._expert_goal_source:
+            extra["expert_goal_frames_npz"] = self._expert_goal_source
+        return pred, extra
 
 
 class RoboRewardBackend(RewardBackend):
@@ -101,16 +213,29 @@ class RoboRewardBackend(RewardBackend):
     ) -> tuple[np.ndarray, dict[str, Any]]:
         out = self._m.compute_progress(frames_hwc, task_description=task_text)
         pred = np.asarray(out, dtype=np.float64).ravel()
-        # Matches robometer RoboReward: one discrete 1–5 judgment, normalized ~[0,1], replicated each frame.
+        if pred.size == 0:
+            return pred, {
+                "backend": self.name,
+                "success_metric": "roboreward_max_bin5",
+                "traj_success_pred": 0.0,
+                "pred_success_dense": pred.astype(np.float64),
+            }
+        disc = _roboreward_discrete_score_from_normalized(pred)
+        traj_s = 1.0 if disc >= 5 else 0.0
+        succ_dense = np.full(pred.shape, traj_s, dtype=np.float64)
         return pred, {
             "backend": self.name,
             "prediction_mode": "end_of_episode_broadcast",
             "note": "RoboReward judges full episode once; per-frame values are constant (not dense progress).",
+            "success_metric": "roboreward_max_bin5",
+            "roboreward_discrete_score": disc,
+            "traj_success_pred": traj_s,
+            "pred_success_dense": succ_dense,
         }
 
 
 class RBMFamilyBackend(RewardBackend):
-    """RBM and ReWiND (reward-fm) checkpoints via robometer RBMModel — same loader."""
+    """RBM / ReWiND via ``RBMModel``. Progress in ``[0, 1]`` from head (Sigmoid or bin expectation) + clip."""
 
     def __init__(self, checkpoint_path: str, name: str = "rbm", max_frames: int | None = 48):
         _ensure_robometer()
@@ -137,8 +262,9 @@ class RBMFamilyBackend(RewardBackend):
         if cap is not None and cap > 0 and t_full > cap:
             idx = np.linspace(0, t_full - 1, cap, dtype=np.int64)
             small = hwc[idx]
-            prog = self._m.compute_progress(small, task_description=task_text)
+            prog, succ_sub = self._m.compute_progress_with_success(small, task_description=task_text)
             pred_sub = np.asarray(prog, dtype=np.float64).ravel()
+            succ_sub = np.asarray(succ_sub, dtype=np.float64).ravel()
             if pred_sub.size != small.shape[0]:
                 logger.warning(
                     "RBM progress length %d != subsampled T %d; trimming",
@@ -149,20 +275,46 @@ class RBMFamilyBackend(RewardBackend):
                 pred_sub = pred_sub[:m]
                 small = small[:m]
                 idx = idx[:m]
-            x_old = np.linspace(0.0, 1.0, num=pred_sub.size)
-            x_new = np.linspace(0.0, 1.0, num=t_full)
-            pred = np.interp(x_new, x_old, pred_sub).astype(np.float64)
+                if succ_sub.size:
+                    succ_sub = succ_sub[:m]
+            pred = np.clip(_interp_01(pred_sub, pred_sub.size, t_full), 0.0, 1.0)
             extra: dict[str, Any] = {
                 "backend": self.name,
                 "frame_subsample_cap": cap,
                 "original_T": t_full,
                 "interpolated_to_dense": True,
+                "success_metric": "rbm_success_head_sigmoid",
             }
+            if succ_sub.size:
+                succ_full = np.clip(_interp_01(succ_sub, succ_sub.size, t_full), 0.0, 1.0)
+                extra["traj_success_pred"] = float(np.any(succ_full > 0.5))
+                extra["pred_success_dense"] = succ_full
+                hit = np.flatnonzero(succ_full > 0.5)
+                ff = float(hit[0]) if hit.size else float("nan")
+                extra["success_pred_first_idx_native"] = ff
+                extra["success_pred_timing_idx_native"] = ff
+                extra["success_pred_native_len"] = int(t_full)
+            else:
+                extra["success_head_missing"] = True
+                extra["traj_success_pred"] = float("nan")
             return pred, extra
 
-        prog = self._m.compute_progress(hwc, task_description=task_text)
-        pred = np.asarray(prog, dtype=np.float64).ravel()
-        return pred, {"backend": self.name}
+        prog, succ_sub = self._m.compute_progress_with_success(hwc, task_description=task_text)
+        pred = np.clip(np.asarray(prog, dtype=np.float64).ravel(), 0.0, 1.0)
+        succ_sub = np.asarray(succ_sub, dtype=np.float64).ravel()
+        extra = {"backend": self.name, "success_metric": "rbm_success_head_sigmoid"}
+        if succ_sub.size:
+            extra["traj_success_pred"] = float(np.any(succ_sub > 0.5))
+            extra["pred_success_dense"] = np.clip(succ_sub, 0.0, 1.0)
+            hit = np.flatnonzero(succ_sub > 0.5)
+            ff = float(hit[0]) if hit.size else float("nan")
+            extra["success_pred_first_idx_native"] = ff
+            extra["success_pred_timing_idx_native"] = ff
+            extra["success_pred_native_len"] = int(succ_sub.size)
+        else:
+            extra["success_head_missing"] = True
+            extra["traj_success_pred"] = float("nan")
+        return pred, extra
 
 
 class SuccessDetectorBackend(RewardBackend):
@@ -286,6 +438,7 @@ class SuccessDetectorBackend(RewardBackend):
                 traj_id,
                 t_use,
             )
+        logits_list: list[float] = []
         probs: list[float] = []
         warn: dict[str, Any] = {
             "latent_T_before_align": t_per_cam,
@@ -298,12 +451,30 @@ class SuccessDetectorBackend(RewardBackend):
                 for cam in cams:
                     x = cam[t : t + 1].to(self.device, dtype=torch.float32)
                     views.append(x)
-                logits = self.model(views)
-                p = torch.sigmoid(logits).item()
-                probs.append(float(p))
+                logit_t = self.model(views)
+                lv = float(logit_t.reshape(-1)[0].item())
+                logits_list.append(lv)
+                p = float(torch.sigmoid(logit_t).reshape(-1)[0].item())
+                probs.append(p)
+        logits_arr = np.asarray(logits_list, dtype=np.float64)
         pred = np.asarray(probs, dtype=np.float64)
+        mask = (logits_arr > 0.0) | (pred > 0.5)
+        traj_success = float(np.any(mask))
+        ff = _first_positive_frame_1d(mask)
         warn["latent_dir"] = str(latent_dir)
+        warn["success_metric"] = "success_detector_logit_or_prob"
+        warn["traj_success_pred"] = traj_success
+        warn["pred_success_dense"] = pred
+        warn["pred_success_logit"] = logits_arr
+        warn["success_pred_first_idx_native"] = ff
+        warn["success_pred_timing_idx_native"] = ff
+        warn["success_pred_native_len"] = int(t_use)
         return pred, warn
+
+
+# Backends that broadcast one scalar to every frame (no dense time-varying progress). Pearson vs per-frame
+# GT in ``reward_eval.compute_metrics`` is skipped when preds are flat; RoboReward is flat by design.
+FLAT_BROADCAST_BACKEND_KINDS: frozenset[str] = frozenset({"roboreward"})
 
 
 def build_backend(kind: str, **kwargs: Any) -> RewardBackend:
@@ -311,14 +482,16 @@ def build_backend(kind: str, **kwargs: Any) -> RewardBackend:
     if k in ("topreward", "topreward_qwen"):
         return TopRewardBackend(
             model_path=kwargs["model_path"],
-            max_frames=int(kwargs.get("max_frames", 64)),
-            num_prefix_samples=int(kwargs.get("num_prefix_samples", 15)),
+            max_frames=int(kwargs.get("max_frames", 48)),
+            num_prefix_samples=int(kwargs.get("num_prefix_samples", 0)),
+            success_threshold=float(kwargs.get("success_threshold", 0.95)),
         )
     if k == "robodopamine":
         return RoboDopamineBackend(
             model_path=kwargs["model_path"],
-            frame_interval=int(kwargs.get("frame_interval", 1)),
+            frame_interval=int(kwargs.get("frame_interval", 5)),
             eval_mode=str(kwargs.get("eval_mode", "incremental")),
+            expert_goal_frames_npz=kwargs.get("expert_goal_frames_npz") or "",
         )
     if k == "rbm":
         mf = kwargs.get("max_frames")

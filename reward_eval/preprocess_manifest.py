@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Build manifest.csv, per-demo frames.npz, gt_dense.npy, and optional mp4."""
+"""Build manifest.csv, per-demo frames.npz, dense GT npy files, and optional mp4.
+
+Primary ``gt_dense.npy`` follows ``--expert-gt`` (linear vs cumulative) for experts and
+cumulative-normalized shaped reward for rollouts. Also writes ``gt_linear_time.npy`` and
+``gt_cumulative_normalized.npy`` so both proxy curves exist for every demo. Per-step
+simulator / shaped rewards remain in ``frames.npz`` (``rewards`` key) from HDF5.
+"""
 
 from __future__ import annotations
 
@@ -167,6 +173,10 @@ def process_hdf5(
             demo_dir.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(demo_dir / "frames.npz", rgb=frames, rewards=rewards)
             np.save(demo_dir / "gt_dense.npy", gt_vec.astype(np.float32))
+            gt_linear = dense_gt_from_rewards(rewards, definition="linear_time_expert")
+            gt_cumulative = dense_gt_from_rewards(rewards, definition="cumulative_normalized")
+            np.save(demo_dir / "gt_linear_time.npy", gt_linear.astype(np.float32))
+            np.save(demo_dir / "gt_cumulative_normalized.npy", gt_cumulative.astype(np.float32))
 
             hdf5_done_mode = ""
             hdf5_task_success_attr = ""
@@ -195,6 +205,8 @@ def process_hdf5(
                 "camera": camera,
                 "frames_npz": str(demo_dir / "frames.npz"),
                 "gt_npy": str(demo_dir / "gt_dense.npy"),
+                "gt_linear_time_npy": str(demo_dir / "gt_linear_time.npy"),
+                "gt_cumulative_normalized_npy": str(demo_dir / "gt_cumulative_normalized.npy"),
                 "task_instruction": DEFAULT_SQUARE_INSTRUCTION,
                 "hdf5_done_mode": hdf5_done_mode,
                 "hdf5_task_success_attr": hdf5_task_success_attr,

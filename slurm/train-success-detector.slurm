@@ -8,8 +8,8 @@
 #SBATCH --job-name=train-success-det
 #SBATCH --time=00:30:00
 #SBATCH --constraint="projects"
-#SBATCH -e slurm-%j.err
-#SBATCH -o slurm-%j.out
+#SBATCH -e slurm-train-success-detector-%j.err
+#SBATCH -o slurm-train-success-detector-%j.out
 #SBATCH --gpus-per-node=1
 #SBATCH --mail-user=ayaans@utexas.edu
 #SBATCH --mail-type="BEGIN,END"

@@ -8,9 +8,9 @@
 #SBATCH --job-name=collect-policy-demos
 #SBATCH --time=04:00:00
 #SBATCH --constraint="projects"
-#SBATCH -e slurm-%j.err
-#SBATCH -o slurm-%j.out
-#SBATCH --gpus-per-node=1
+#SBATCH -e slurm-collect-policy-demos-%j.err
+#SBATCH -o slurm-collect-policy-demos-%j.out
+#SBATCH --gpus-per-node=1 
 #SBATCH --mail-user=ayaans@utexas.edu
 #SBATCH --mail-type="BEGIN,END"
  

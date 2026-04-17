@@ -9,8 +9,8 @@
 #SBATCH --time=04:00:00
 #SBATCH --gpus-per-node=1
 #SBATCH --constraint=projects
-#SBATCH -e slurm-%j.err
-#SBATCH -o slurm-%j.out
+#SBATCH -e slurm-topreward-%j.err
+#SBATCH -o slurm-topreward-%j.out
 #SBATCH --mail-user=ayaans@utexas.edu
 #SBATCH --mail-type="BEGIN,END"
 
@@ -23,6 +23,10 @@ MANIFEST="${MANIFEST:-${CACHE_ROOT}/manifest.csv}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-8B-Instruct}"
 ROBOMETER_ROOT="${ROBOMETER_ROOT:-/u/asunesara/robometer}"
 RESUME="${RESUME:-0}"
+# Default: dense prefixes (0) + max_frames=48 to align with robometer RBM (--rbm-max-frames). Override
+# TOPREWARD_NUM_PREFIX_SAMPLES=15 for faster sparse+interp curves. Cost scales with frames × forwards.
+TOPREWARD_NUM_PREFIX_SAMPLES="${TOPREWARD_NUM_PREFIX_SAMPLES:-0}"
+TOPREWARD_MAX_FRAMES="${TOPREWARD_MAX_FRAMES:-48}"
 
 export PYTHONPATH="${REWARD_DESIGN_ROOT}:${ROBOMETER_ROOT}:${PYTHONPATH}"
 
@@ -36,5 +40,7 @@ uv run python -m reward_eval.run_reward_inference \
   --manifest "${MANIFEST}" \
   --backend topreward_qwen \
   --model-path "${MODEL_PATH}" \
+  --topreward-max-frames "${TOPREWARD_MAX_FRAMES}" \
+  --topreward-num-prefix-samples "${TOPREWARD_NUM_PREFIX_SAMPLES}" \
   --predictions-dir "${CACHE_ROOT}/predictions/topreward_qwen" \
   "${EXTRA[@]}"
